@@ -1,0 +1,131 @@
+---
+# ── Party Service Deployment ──────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: party-service
+  namespace: bankonboard
+  labels:
+    app: party-service
+    version: "4.0.0"
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: party-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0      # Zero-downtime deploy
+  template:
+    metadata:
+      labels:
+        app: party-service
+        version: "4.0.0"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: party-service
+          image: $(ACR_NAME)/party-service:$(IMAGE_TAG)
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: JWT_SECRET
+            - name: SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: SERVICE_API_KEY
+          envFrom:
+            - configMapRef:
+                name: bankonboard-config
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]   # Allow in-flight requests to drain
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [party-service]
+                topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: party-service
+  namespace: bankonboard
+spec:
+  selector:
+    app: party-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+# ── Horizontal Pod Autoscaler ─────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: party-service-hpa
+  namespace: bankonboard
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: party-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

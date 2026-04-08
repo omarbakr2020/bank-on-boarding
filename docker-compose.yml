@@ -1,0 +1,178 @@
+# ─────────────────────────────────────────────────────────────
+#  BankOnboard — Full Local Development Stack
+#
+#  Services:
+#    frontend      :4200  — Angular SPA
+#    gateway       :3000  — Node.js OAuth2 + API gateway
+#    party-service :8000  — FastAPI TMF632 (/docs)
+#    ai-service    :8001  — FastAPI AI risk + Redis worker
+#    postgres      :5432  — PostgreSQL 15
+#    redis         :6379  — Redis 7
+#
+#  Quick start:
+#    cp .env.example .env && docker-compose up --build
+# ─────────────────────────────────────────────────────────────
+
+networks:
+  bankonboard:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: bo-postgres
+    restart: unless-stopped
+    networks: [bankonboard]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-0000}
+      POSTGRES_DB: ${POSTGRES_DB:-bankonboard}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-bankonboard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Redis ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bo-redis
+    restart: unless-stopped
+    networks: [bankonboard]
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Party Service (FastAPI TMF632) ─────────────────────────
+  party-service:
+    build:
+      context: ./party-service
+      dockerfile: Dockerfile
+    container_name: bo-party
+    restart: unless-stopped
+    networks: [bankonboard]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-0000}@postgres:5432/${POSTGRES_DB:-bankonboard}
+      JWT_SECRET: ${JWT_SECRET:-7a41986d25d4cd4d970256d6acca098d2621584a97b0f17155a6f4c1a3896a8f9422dcd4fb23ce74ee9a11bd4e9ba56a52b0f8ab0b4f5f78a2e37c1f2eeef399}
+      JWT_ISSUER: ${JWT_ISSUER:-https://bankonboard.io}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-bankonboard-api}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-aece1cd8c648aa54d8bf75ddb68869f05b7c6f35c40a39e918f1440a2deb43f5}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4200}
+      GATEWAY_URL: http://gateway:3000
+      SQL_ECHO: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── AI Risk Service (FastAPI + Redis Worker) ───────────────
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: bo-ai
+    restart: unless-stopped
+    networks: [bankonboard]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      REDIS_URL: redis://redis:6379
+      PARTY_SERVICE_URL: http://party-service:8000
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-aece1cd8c648aa54d8bf75ddb68869f05b7c6f35c40a39e918f1440a2deb43f5}
+      GATEWAY_URL: http://gateway:3000
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+      party-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Gateway (Node.js OAuth2 + Proxy) ──────────────────────
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: bo-gateway
+    restart: unless-stopped
+    networks: [bankonboard]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-7a41986d25d4cd4d970256d6acca098d2621584a97b0f17155a6f4c1a3896a8f9422dcd4fb23ce74ee9a11bd4e9ba56a52b0f8ab0b4f5f78a2e37c1f2eeef399}
+      JWT_ISSUER: ${JWT_ISSUER:-https://bankonboard.io}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-bankonboard-api}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-15}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-7}
+      PARTY_SERVICE_URL: http://party-service:8000
+      AI_SERVICE_URL: http://ai-service:8001
+      REDIS_URL: redis://redis:6379
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4200}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-aece1cd8c648aa54d8bf75ddb68869f05b7c6f35c40a39e918f1440a2deb43f5}
+      RATE_LIMIT_WINDOW_MS: 60000
+      RATE_LIMIT_MAX_REQUESTS: 100
+    ports:
+      - "3000:3000"
+    depends_on:
+      party-service:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Angular Frontend ───────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bo-frontend
+    restart: unless-stopped
+    networks: [bankonboard]
+    ports:
+      - "4200:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

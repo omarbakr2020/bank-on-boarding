@@ -1,0 +1,345 @@
+# ─────────────────────────────────────────────────────────────
+#  BankOnboard — Azure DevOps CI/CD Pipeline
+#
+#  Stages:
+#    1. Test        — run all tests (Python + Node.js)
+#    2. Build       — build Docker images, push to ACR
+#    3. Deploy Dev  — deploy to dev AKS namespace
+#    4. Deploy Prod — deploy to prod (manual approval gate)
+#
+#  Prerequisites (Azure DevOps Library variable groups):
+#    bankonboard-secrets:
+#      ACR_NAME              — myregistry.azurecr.io
+#      AKS_CLUSTER_NAME      — bankonboard-aks
+#      AKS_RESOURCE_GROUP    — bankonboard-rg
+#      OPENAI_API_KEY        — sk-...
+#      JWT_SECRET            — (64-char hex)
+#      SERVICE_API_KEY       — (32-char hex)
+#      POSTGRES_PASSWORD     — (strong password)
+# ─────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+      - "*.md"
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: bankonboard-secrets
+  - name: IMAGE_TAG
+    value: $(Build.BuildId)
+  - name: PYTHON_VERSION
+    value: "3.11"
+  - name: NODE_VERSION
+    value: "20"
+
+# ─────────────────────────────────────────────────────────────
+stages:
+
+# ─── Stage 1: Test ───────────────────────────────────────────
+- stage: Test
+  displayName: "Test — run all service tests"
+  jobs:
+
+    - job: TestPartyService
+      displayName: "Party Service — pytest"
+      steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: $(PYTHON_VERSION)
+          displayName: "Set Python version"
+
+        - script: |
+            cd party-service
+            pip install --upgrade pip
+            pip install -r requirements.txt
+          displayName: "Install dependencies"
+
+        - script: |
+            cd party-service
+            python -m pytest app/tests/ \
+              --tb=short \
+              --cov=app \
+              --cov-report=xml:coverage.xml \
+              --cov-report=term-missing \
+              -v
+          displayName: "Run pytest"
+          env:
+            DATABASE_URL: "sqlite:///./test.db"
+            JWT_SECRET: "test-secret-do-not-use-in-prod"
+            SERVICE_API_KEY: "test-key"
+
+        - task: PublishTestResults@2
+          condition: always()
+          inputs:
+            testResultsFormat: JUnit
+            testResultsFiles: "party-service/test-results.xml"
+            failTaskOnFailedTests: true
+          displayName: "Publish test results"
+
+        - task: PublishCodeCoverageResults@1
+          inputs:
+            codeCoverageTool: Cobertura
+            summaryFileLocation: "party-service/coverage.xml"
+          displayName: "Publish coverage"
+
+    - job: TestAIService
+      displayName: "AI Service — pytest"
+      steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: $(PYTHON_VERSION)
+
+        - script: |
+            cd ai-service
+            pip install -r requirements.txt
+            python -m pytest app/tests/ --tb=short -v
+          displayName: "Run pytest"
+          env:
+            OPENAI_API_KEY: "test-key"
+            REDIS_URL: "redis://localhost:6379"
+            PARTY_SERVICE_URL: "http://localhost:8000"
+            SERVICE_API_KEY: "test-key"
+
+    - job: TestGateway
+      displayName: "Gateway — Jest"
+      steps:
+        - task: NodeTool@0
+          inputs:
+            versionSpec: $(NODE_VERSION)
+          displayName: "Set Node.js version"
+
+        - script: |
+            cd gateway
+            npm ci
+            npm test -- --coverage --coverageReporters=cobertura
+          displayName: "Run Jest tests"
+
+        - task: PublishCodeCoverageResults@1
+          inputs:
+            codeCoverageTool: Cobertura
+            summaryFileLocation: "gateway/coverage/cobertura-coverage.xml"
+
+    - job: LintAndTypeCheck
+      displayName: "Lint + type check"
+      steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: $(PYTHON_VERSION)
+
+        - task: NodeTool@0
+          inputs:
+            versionSpec: $(NODE_VERSION)
+
+        - script: |
+            pip install ruff mypy
+            cd party-service && ruff check app/ && echo "Party service lint OK"
+            cd ../ai-service && ruff check app/ && echo "AI service lint OK"
+          displayName: "Python lint (ruff)"
+
+        - script: |
+            cd gateway
+            npm ci
+            npx tsc --noEmit
+          displayName: "TypeScript type check"
+
+# ─── Stage 2: Build ──────────────────────────────────────────
+- stage: Build
+  displayName: "Build — Docker images → ACR"
+  dependsOn: Test
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+
+    - job: BuildImages
+      displayName: "Build and push all images"
+      steps:
+        - task: Docker@2
+          displayName: "Login to ACR"
+          inputs:
+            command: login
+            containerRegistry: acr-service-connection
+
+        - task: Docker@2
+          displayName: "Build and push party-service"
+          inputs:
+            command: buildAndPush
+            repository: party-service
+            dockerfile: party-service/Dockerfile
+            containerRegistry: acr-service-connection
+            tags: |
+              $(IMAGE_TAG)
+              latest
+
+        - task: Docker@2
+          displayName: "Build and push ai-service"
+          inputs:
+            command: buildAndPush
+            repository: ai-service
+            dockerfile: ai-service/Dockerfile
+            containerRegistry: acr-service-connection
+            tags: |
+              $(IMAGE_TAG)
+              latest
+
+        - task: Docker@2
+          displayName: "Build and push gateway"
+          inputs:
+            command: buildAndPush
+            repository: gateway
+            dockerfile: gateway/Dockerfile
+            containerRegistry: acr-service-connection
+            tags: |
+              $(IMAGE_TAG)
+              latest
+
+        - task: Docker@2
+          displayName: "Build and push frontend"
+          inputs:
+            command: buildAndPush
+            repository: frontend
+            dockerfile: frontend/Dockerfile
+            containerRegistry: acr-service-connection
+            tags: |
+              $(IMAGE_TAG)
+              latest
+
+        # Replace $(ACR_NAME) and $(IMAGE_TAG) placeholders in manifests
+        - script: |
+            find k8s/ -name "*.yaml" -exec sed -i \
+              "s|\$(ACR_NAME)|$(ACR_NAME)|g; s|\$(IMAGE_TAG)|$(IMAGE_TAG)|g" {} \;
+          displayName: "Substitute image tags in K8s manifests"
+
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: k8s/
+            artifact: k8s-manifests
+          displayName: "Publish K8s manifests artifact"
+
+# ─── Stage 3: Deploy to Dev ───────────────────────────────────
+- stage: DeployDev
+  displayName: "Deploy — development"
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    NAMESPACE: bankonboard-dev
+  jobs:
+
+    - deployment: DeployToDev
+      displayName: "Deploy to AKS dev namespace"
+      environment: bankonboard-dev
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifact: k8s-manifests
+                  path: $(Pipeline.Workspace)/k8s
+
+              - task: AzureCLI@2
+                displayName: "Get AKS credentials"
+                inputs:
+                  azureSubscription: azure-service-connection
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az aks get-credentials \
+                      --name $(AKS_CLUSTER_NAME) \
+                      --resource-group $(AKS_RESOURCE_GROUP) \
+                      --overwrite-existing
+
+              - task: KubernetesManifest@0
+                displayName: "Apply secrets"
+                inputs:
+                  action: createSecret
+                  namespace: $(NAMESPACE)
+                  secretName: bankonboard-secrets
+                  secretType: generic
+                  secretArguments: >
+                    --from-literal=JWT_SECRET=$(JWT_SECRET)
+                    --from-literal=SERVICE_API_KEY=$(SERVICE_API_KEY)
+                    --from-literal=OPENAI_API_KEY=$(OPENAI_API_KEY)
+                    --from-literal=DATABASE_URL=postgresql://bankonboard:$(POSTGRES_PASSWORD)@postgres-service:5432/bankonboard
+                    --from-literal=REDIS_URL=redis://redis-service:6379
+
+              - task: KubernetesManifest@0
+                displayName: "Deploy all manifests"
+                inputs:
+                  action: deploy
+                  namespace: $(NAMESPACE)
+                  manifests: |
+                    $(Pipeline.Workspace)/k8s/00-namespace-secrets.yaml
+                    $(Pipeline.Workspace)/k8s/01-databases.yaml
+                    $(Pipeline.Workspace)/k8s/02-party-service.yaml
+                    $(Pipeline.Workspace)/k8s/03-ai-service.yaml
+                    $(Pipeline.Workspace)/k8s/04-gateway-frontend.yaml
+                    $(Pipeline.Workspace)/k8s/05-ingress.yaml
+
+              - script: |
+                  kubectl rollout status deployment/party-service -n $(NAMESPACE) --timeout=120s
+                  kubectl rollout status deployment/gateway -n $(NAMESPACE) --timeout=120s
+                  kubectl rollout status deployment/frontend -n $(NAMESPACE) --timeout=120s
+                displayName: "Verify rollout"
+
+# ─── Stage 4: Deploy to Production ───────────────────────────
+- stage: DeployProd
+  displayName: "Deploy — production"
+  dependsOn: DeployDev
+  condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+  variables:
+    NAMESPACE: bankonboard
+  jobs:
+
+    - deployment: DeployToProd
+      displayName: "Deploy to AKS production (approval required)"
+      environment: bankonboard-production  # Has approval gate in Azure DevOps
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifact: k8s-manifests
+                  path: $(Pipeline.Workspace)/k8s
+
+              - task: AzureCLI@2
+                displayName: "Get AKS credentials"
+                inputs:
+                  azureSubscription: azure-service-connection
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az aks get-credentials \
+                      --name $(AKS_CLUSTER_NAME) \
+                      --resource-group $(AKS_RESOURCE_GROUP) \
+                      --overwrite-existing
+
+              - task: KubernetesManifest@0
+                displayName: "Deploy to production"
+                inputs:
+                  action: deploy
+                  namespace: $(NAMESPACE)
+                  manifests: |
+                    $(Pipeline.Workspace)/k8s/02-party-service.yaml
+                    $(Pipeline.Workspace)/k8s/03-ai-service.yaml
+                    $(Pipeline.Workspace)/k8s/04-gateway-frontend.yaml
+
+              - script: |
+                  echo "Verifying production deployment..."
+                  kubectl rollout status deployment/party-service -n $(NAMESPACE) --timeout=180s
+                  kubectl rollout status deployment/gateway -n $(NAMESPACE) --timeout=180s
+                  echo "✅ Production deployment successful. Build: $(IMAGE_TAG)"
+                displayName: "Verify production rollout"

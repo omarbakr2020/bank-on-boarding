@@ -1,0 +1,146 @@
+---
+# ── Gateway Deployment ────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: bankonboard
+  labels:
+    app: gateway
+    tier: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gateway
+          image: $(ACR_NAME)/gateway:$(IMAGE_TAG)
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: JWT_SECRET
+            - name: SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: SERVICE_API_KEY
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bankonboard-secrets
+                  key: REDIS_URL
+          envFrom:
+            - configMapRef:
+                name: bankonboard-config
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "300m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: bankonboard
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+
+---
+# ── Frontend Deployment ───────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: bankonboard
+  labels:
+    app: frontend
+    tier: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: $(ACR_NAME)/frontend:$(IMAGE_TAG)
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: bankonboard
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

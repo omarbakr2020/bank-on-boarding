@@ -1,0 +1,102 @@
+---
+# ── Ingress ───────────────────────────────────────────────────
+# Requires: nginx ingress controller + cert-manager (Let's Encrypt)
+# In production: put Azure API Management (APIM) in front of this
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bankonboard-ingress
+  namespace: bankonboard
+  annotations:
+    # nginx ingress controller
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+    # Rate limiting at ingress level
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+
+    # cert-manager for TLS
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+    # Azure-specific annotations (if using AKS + Application Gateway)
+    # kubernetes.azure.com/load-balancer-health-probe-request-path: "/health"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - bankonboard.io
+        - api.bankonboard.io
+      secretName: bankonboard-tls
+  rules:
+    # ── Main app ─────────────────────────────────────────
+    - host: bankonboard.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
+    # ── API (gateway) ────────────────────────────────────
+    - host: api.bankonboard.io
+      http:
+        paths:
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 3000
+          - path: /tmApi
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 3000
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 3000
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 3000
+
+---
+# ── PodDisruptionBudget — keep 1 party-service pod always up ─
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: party-service-pdb
+  namespace: bankonboard
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: party-service
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: bankonboard
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway
