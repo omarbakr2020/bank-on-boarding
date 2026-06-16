@@ -15,7 +15,10 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-in-production',
   issuer: process.env.JWT_ISSUER || 'https://bankonboard.io',
   audience: process.env.JWT_AUDIENCE || 'bankonboard-api',
-  accessTokenTtlMinutes: parseInt(process.env.ACCESS_TOKEN_TTL_MINUTES || '15', 10),
+  accessTokenTtlMinutes: parseInt(
+    process.env.ACCESS_TOKEN_TTL_MINUTES || '15',
+    10,
+  ),
   refreshTokenTtlDays: parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '7', 10),
 
   // Downstream services
@@ -30,7 +33,10 @@ export const config = {
 
   // Rate limiting
   rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
-  rateLimitMaxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
+  rateLimitMaxRequests: parseInt(
+    process.env.RATE_LIMIT_MAX_REQUESTS || '100',
+    10,
+  ),
 
   // Service-to-service
   serviceApiKey: process.env.SERVICE_API_KEY || 'dev-service-key',
@@ -44,8 +50,15 @@ export const oauthClients: Record<string, OAuthClient> = {
     redirectUris: [
       'http://localhost:4200/auth/callback',
       'https://bankonboard.io/auth/callback',
+      'https://bankonboard-frontend.up.railway.app/auth/callback',
     ],
-    allowedScopes: ['openid', 'profile', 'party:read', 'party:write', 'ai:invoke'],
+    allowedScopes: [
+      'openid',
+      'profile',
+      'party:read',
+      'party:write',
+      'ai:invoke',
+    ],
     pkceRequired: true,
     public: true, // public client — no client secret
   },
