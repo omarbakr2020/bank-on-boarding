@@ -50,7 +50,7 @@ export const oauthClients: Record<string, OAuthClient> = {
     redirectUris: [
       'http://localhost:4200/auth/callback',
       'https://bankonboard.io/auth/callback',
-      'https://bankonboard-frontend.up.railway.app/auth/callback',
+      'https://accurate-love-production-9287.up.railway.app/auth/callback',
     ],
     allowedScopes: [
       'openid',
